@@ -22,19 +22,24 @@ $(call inherit-product, $(SRC_TARGET_DIR)/product/full_base_telephony.mk)
 # Inherit from r8q device
 $(call inherit-product, device/samsung/r8q/device.mk)
 
-# Inherit some common Halcyon stuff
-$(call inherit-product, vendor/circle/config/common_full_phone.mk)
+# Inherit some common Axion stuff
+TARGET_DISABLE_EPPE := true
+$(call inherit-product, vendor/lineage/config/common_full_phone.mk)
 
 # Boot animation
 TARGET_SCREEN_HEIGHT := 2400
 TARGET_SCREEN_WIDTH := 1080
 
-# CiRCLE  BUILT INS
-CIRCLE_BUILDTYPE := UNOFFICIAL
-WITH_GMS := true
-CIRCLE_MAINTAINER :=  Yume
+# AXION STUFF
+TARGET_INCLUDE_AXFX := true
+AXION_CAMERA_REAR_INFO := 12,8,12
+AXION_CAMERA_FRONT_INFO := 32
+AXION_MAINTAINER := melon
+AXION_PROCESSOR := Snapdragon_865_5G
+TARGET_INCLUDES_LOS_PREBUILTS := true
+TORCH_STR_SUPPORTED := true
 ## Device identifier. This must come after all inclusions
-PRODUCT_NAME := circle_r8q
+PRODUCT_NAME := lineage_r8q
 PRODUCT_DEVICE := r8q
 PRODUCT_BRAND := samsung
 PRODUCT_MODEL := S20FE
