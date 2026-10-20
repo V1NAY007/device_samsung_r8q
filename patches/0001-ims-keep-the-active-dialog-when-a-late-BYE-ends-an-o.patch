@@ -1,0 +1,206 @@
+From 40e3629fb2ced12559f1f9891a657bc3e779d816 Mon Sep 17 00:00:00 2001
+From: Port <port@localhost>
+Date: Mon, 19 Oct 2026 12:13:34 +0000
+Subject: [PATCH 1/2] ims: keep the active dialog when a late BYE ends an older
+ call
+
+A late remote BYE for an already-ended dialog frequently arrives while a
+newer call is already current: the local BYE response times out on the
+carrier, the carrier's own media supervision then sends its own BYE for
+the same dialog.
+
+handleCancel and handleRemoteDialogTerminationAfterCleanup cleared
+currentCall, stopped the call runtime, and cleared PRACK wait state
+unconditionally, without checking which dialog the termination targets.
+The active call's dialog was destroyed, its next in-dialog UPDATE was
+rejected with current=null, and the carrier tore the new call down with
+a final INVITE failure.
+
+Only let a remote termination mutate dialog, listener, and runtime
+state when its Call-ID targets the current call, the pending outgoing
+INVITE, or the pending waiting INVITE. Late or unknown terminations are
+acknowledged with 200 OK while the active call stays untouched, and the
+terminated dialog's direction flags now come from the dialog actually
+being terminated instead of whatever call happens to be current.
+
+Signed-off-by: Port <port@localhost>
+---
+ app/src/main/java/me/phh/sip/SipHandler.kt    | 47 +++++++++++++++++--
+ .../me/phh/sip/SipRemoteDialogTermination.kt  | 27 ++++++++++-
+ .../phh/sip/SipRemoteDialogTerminationTest.kt | 40 ++++++++++++++++
+ 3 files changed, 108 insertions(+), 6 deletions(-)
+
+diff --git a/app/src/main/java/me/phh/sip/SipHandler.kt b/app/src/main/java/me/phh/sip/SipHandler.kt
+index 3ff2405..e50d814 100644
+--- a/app/src/main/java/me/phh/sip/SipHandler.kt
++++ b/app/src/main/java/me/phh/sip/SipHandler.kt
+@@ -3964,16 +3964,31 @@ fun onWfcDisabled(reason: String) {
+         val remoteMethodReason = SipRemoteDialogTermination.remoteMethodReason(request.method)
+         sessionRefresher.cancel(callId, remoteMethodReason)
+         dispatcher.removeWriterForCallId(callId)
+-        if (currentCall?.outgoing == false) rememberTerminatedIncomingCall(callId, remoteMethodReason)
+-        val terminatedCall = currentCall
++        // Only the dialog this termination actually targets may be cleared. A
++        // late BYE for an already-ended dialog frequently arrives while a newer
++        // call is already current (local BYE response timeout, then the remote
++        // sends its own BYE); clearing the current dialog there kills the new
++        // call's in-dialog UPDATE handling and the call itself.
++        val terminatedCall = currentCall?.takeIf { it.callIdOrNull() == callId }
++        val terminatedDialogIsIncoming =
++            terminatedCall?.outgoing == false ||
++                (terminatedCall == null && pendingWaitingInvite?.callId == callId)
++        val terminatedDialogIsOutgoing =
++            terminatedCall?.outgoing == true ||
++                (terminatedCall == null && pendingOutgoingInvite?.callId == callId)
++        if (terminatedDialogIsIncoming) {
++            rememberTerminatedIncomingCall(callId, remoteMethodReason)
++        }
+         val heldToResume = heldForegroundCall?.takeIf { terminatedCall != null && isBye }
+-        currentCall = null
++        if (terminatedCall != null) {
++            currentCall = null
++        }
+         clearPendingOutgoingInvite(callId, closeRtpSocket = false, reason = remoteMethodReason)
+         val cancelExtras = SipRemoteDialogTermination.remoteEndExtras(
+             logTag = TAG,
+             callId = callId,
+             isBye = isBye,
+-            isOutgoingCall = terminatedCall?.outgoing == true,
++            isOutgoingCall = terminatedDialogIsOutgoing,
+             outgoingConnectedNotified = terminatedCall?.outgoingConnectedNotified?.get() == true,
+         )
+         onCancelledCall?.invoke(Object(), "", cancelExtras)
+@@ -4049,6 +4064,30 @@ fun onWfcDisabled(reason: String) {
+             isBye = isBye,
+         )?.let { return it }
+ 
++        if (!SipRemoteDialogTermination.targetsKnownDialog(
++                requestCallId = callId,
++                currentCallId = currentCall?.callIdOrNull(),
++                pendingOutgoingCallId = pendingOutgoingInvite?.callId,
++                pendingWaitingCallId = pendingWaitingInvite?.callId,
++            )
++        ) {
++            // A late BYE/CANCEL for a dialog that is no longer current must not
++            // clear the active call's dialog, listener wiring, or runtime. The
++            // framework already reported the locally terminated call, so the
++            // stale termination is only acknowledged here.
++            sessionRefresher.cancel(callId, "remote ${request.method}")
++            dispatcher.removeWriterForCallId(callId)
++            Rlog.w(
++                TAG,
++                SipRemoteDialogTermination.lateNonCurrentDialogLog(
++                    method = request.method,
++                    callId = callId,
++                    currentCallId = currentCall?.callIdOrNull(),
++                ),
++            )
++            return 200
++        }
++
+         stopCallRuntime(SipRemoteDialogTermination.cleanupReason())
+         prAckWaitTracker.clearAndNotifyAll()
+ 
+diff --git a/app/src/main/java/me/phh/sip/SipRemoteDialogTermination.kt b/app/src/main/java/me/phh/sip/SipRemoteDialogTermination.kt
+index 6b2c85a..a7c5afd 100644
+--- a/app/src/main/java/me/phh/sip/SipRemoteDialogTermination.kt
++++ b/app/src/main/java/me/phh/sip/SipRemoteDialogTermination.kt
+@@ -4,6 +4,31 @@ import java.io.OutputStream
+ 
+ internal object SipRemoteDialogTermination {
+ 
++    /**
++     * A remote BYE/CANCEL may only mutate dialog and listener state when it
++     * targets a dialog this stack still knows: the current call, the pending
++     * outgoing INVITE, or the pending waiting INVITE. A late termination for
++     * an already-ended dialog must be acknowledged without disturbing the
++     * active call.
++     */
++    fun targetsKnownDialog(
++        requestCallId: String,
++        currentCallId: String?,
++        pendingOutgoingCallId: String?,
++        pendingWaitingCallId: String?,
++    ): Boolean =
++        requestCallId == currentCallId ||
++            requestCallId == pendingOutgoingCallId ||
++            requestCallId == pendingWaitingCallId
++
++    fun lateNonCurrentDialogLog(
++        method: SipMethod,
++        callId: String,
++        currentCallId: String?,
++    ): String =
++        "Acknowledging late $method for non-current dialog without disturbing the active call: " +
++            "callId=$callId current=${currentCallId ?: "none"}"
++
+     fun localDialogRequestWriter(
+         incomingResponseWriter: OutputStream?,
+         registeredDialogWriter: OutputStream?,
+@@ -13,8 +38,6 @@ internal object SipRemoteDialogTermination {
+ 
+ 
+ 
+-
+-
+     fun deferredLocalByeAfterAckLog(): String =
+         "ACK received after local pre-ACK hangup; sending deferred BYE"
+ 
+diff --git a/app/src/test/java/me/phh/sip/SipRemoteDialogTerminationTest.kt b/app/src/test/java/me/phh/sip/SipRemoteDialogTerminationTest.kt
+index 331da0e..8b9c189 100644
+--- a/app/src/test/java/me/phh/sip/SipRemoteDialogTerminationTest.kt
++++ b/app/src/test/java/me/phh/sip/SipRemoteDialogTerminationTest.kt
+@@ -2,10 +2,50 @@
+ package me.phh.sip
+ 
+ import java.io.ByteArrayOutputStream
++import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertSame
++import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+ class SipRemoteDialogTerminationTest {
++    @Test
++    fun `late bye for an already ended dialog targets no known call`() {
++        assertFalse(
++            SipRemoteDialogTermination.targetsKnownDialog(
++                requestCallId = "ended-call",
++                currentCallId = "new-active-call",
++                pendingOutgoingCallId = null,
++                pendingWaitingCallId = null,
++            )
++        )
++        assertFalse(
++            SipRemoteDialogTermination.targetsKnownDialog(
++                requestCallId = "unknown-call",
++                currentCallId = null,
++                pendingOutgoingCallId = null,
++                pendingWaitingCallId = null,
++            )
++        )
++    }
++
++    @Test
++    fun `current pending outgoing and waiting dialogs stay targetable`() {
++        val currentCallId = "current-call"
++        val pendingOutgoingCallId = "pending-outgoing-call"
++        val pendingWaitingCallId = "pending-waiting-call"
++
++        listOf(currentCallId, pendingOutgoingCallId, pendingWaitingCallId).forEach { callId ->
++            assertTrue(
++                SipRemoteDialogTermination.targetsKnownDialog(
++                    requestCallId = callId,
++                    currentCallId = currentCallId,
++                    pendingOutgoingCallId = pendingOutgoingCallId,
++                    pendingWaitingCallId = pendingWaitingCallId,
++                )
++            )
++        }
++    }
++
+     @Test
+     fun `incoming dialog writer wins over dormant main flow`() {
+         val incomingWriter = ByteArrayOutputStream()
+-- 
+2.47.3
+

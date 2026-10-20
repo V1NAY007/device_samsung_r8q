@@ -1,0 +1,182 @@
+From c000fa1859d52216bd13cc25aa1ac894adc7bd68 Mon Sep 17 00:00:00 2001
+From: Port <port@localhost>
+Date: Mon, 19 Oct 2026 12:14:28 +0000
+Subject: [PATCH 2/2] ims: route local BYE over the protected client flow first
+
+UE-originated in-dialog requests belong on the protected client flow.
+Carriers enforcing 3GPP TS 33.203 protected flow separation drop UE
+requests that arrive on the protected server flow: on Airtel the local
+BYE was written to the accepted TCP server flow that delivered the
+carrier's in-dialog UPDATEs, never answered, timed out after four
+seconds, and the carrier's own media supervision BYE for the same dialog
+arrived afterwards.
+
+Prefer the main control flow, recovered on demand, for the local BYE and
+fall back to the dialog writers only when it cannot be provided, so
+hanging up still never throws out of the IMS handler when the main flow
+is dormant. In-dialog request headers such as Via are built from the
+main flow, so this also keeps the sent-by consistent with the transport
+actually used.
+
+Signed-off-by: Port <port@localhost>
+---
+ app/src/main/java/me/phh/sip/SipHandler.kt    | 16 +++++--
+ .../me/phh/sip/SipRemoteDialogTermination.kt  | 19 +++++++-
+ .../phh/sip/SipRemoteDialogTerminationTest.kt | 44 ++++++++++++-------
+ 3 files changed, 56 insertions(+), 23 deletions(-)
+
+diff --git a/app/src/main/java/me/phh/sip/SipHandler.kt b/app/src/main/java/me/phh/sip/SipHandler.kt
+index e50d814..7573e15 100644
+--- a/app/src/main/java/me/phh/sip/SipHandler.kt
++++ b/app/src/main/java/me/phh/sip/SipHandler.kt
+@@ -5115,11 +5115,11 @@ fun onWfcDisabled(reason: String) {
+             callId?.let { dispatcher.writerForCallId(it) }
+         val byeWriter = try {
+             SipRemoteDialogTermination.localDialogRequestWriter(
+-                incomingResponseWriter = call.incomingResponseWriter,
+-                registeredDialogWriter = registeredDialogWriter,
+-                fallbackWriter = {
++                mainFlowWriter = {
+                     mainSipWriterForOutbound("local BYE")
+                 },
++                incomingResponseWriter = call.incomingResponseWriter,
++                registeredDialogWriter = registeredDialogWriter,
+             )
+         } catch (t: Throwable) {
+             recoverAfterLocalTerminateWriteFailure(
+@@ -5130,10 +5130,18 @@ fun onWfcDisabled(reason: String) {
+             )
+             return
+         }
++        val byeTransport = when {
++            call.incomingResponseWriter != null && byeWriter === call.incomingResponseWriter ->
++                "dialog-incoming"
++            registeredDialogWriter != null && byeWriter === registeredDialogWriter ->
++                "dialog-registered"
++            else -> "main"
++        }
+         Rlog.d(
+             TAG,
+-            "Routing local BYE on dialog flow: " +
++            "Routing local BYE: " +
+                 "callId=$callId " +
++                "transport=$byeTransport " +
+                 "incomingWriter=${call.incomingResponseWriter != null} " +
+                 "registeredWriter=${registeredDialogWriter != null}",
+         )
+diff --git a/app/src/main/java/me/phh/sip/SipRemoteDialogTermination.kt b/app/src/main/java/me/phh/sip/SipRemoteDialogTermination.kt
+index a7c5afd..14905db 100644
+--- a/app/src/main/java/me/phh/sip/SipRemoteDialogTermination.kt
++++ b/app/src/main/java/me/phh/sip/SipRemoteDialogTermination.kt
+@@ -29,12 +29,27 @@ internal object SipRemoteDialogTermination {
+         "Acknowledging late $method for non-current dialog without disturbing the active call: " +
+             "callId=$callId current=${currentCallId ?: "none"}"
+ 
++    /**
++     * Pick the transport for a UE-originated in-dialog request such as a local
++     * BYE. The protected client flow is the correct transport for UE-originated
++     * requests: carriers enforcing 3GPP TS 33.203 protected flow separation
++     * drop UE requests that arrive on the protected server flow, and in-dialog
++     * request headers (Via sent-by) are built from the main control flow.
++     *
++     * The dialog writers remain a fallback for the case where the main control
++     * flow is dormant and cannot be reopened on demand, so hanging up never
++     * throws out of the IMS handler and restarts the service.
++     */
+     fun localDialogRequestWriter(
++        mainFlowWriter: () -> OutputStream,
+         incomingResponseWriter: OutputStream?,
+         registeredDialogWriter: OutputStream?,
+-        fallbackWriter: () -> OutputStream,
+     ): OutputStream =
+-        incomingResponseWriter ?: registeredDialogWriter ?: fallbackWriter()
++        try {
++            mainFlowWriter()
++        } catch (t: Throwable) {
++            incomingResponseWriter ?: registeredDialogWriter ?: throw t
++        }
+ 
+ 
+ 
+diff --git a/app/src/test/java/me/phh/sip/SipRemoteDialogTerminationTest.kt b/app/src/test/java/me/phh/sip/SipRemoteDialogTerminationTest.kt
+index 8b9c189..88400bf 100644
+--- a/app/src/test/java/me/phh/sip/SipRemoteDialogTerminationTest.kt
++++ b/app/src/test/java/me/phh/sip/SipRemoteDialogTerminationTest.kt
+@@ -47,47 +47,57 @@ class SipRemoteDialogTerminationTest {
+     }
+ 
+     @Test
+-    fun `incoming dialog writer wins over dormant main flow`() {
++    fun `main protected client flow wins for local BYE`() {
+         val incomingWriter = ByteArrayOutputStream()
+         val registeredWriter = ByteArrayOutputStream()
+-        var fallbackCalled = false
++        val mainWriter = ByteArrayOutputStream()
+ 
+         val selected = SipRemoteDialogTermination.localDialogRequestWriter(
++            mainFlowWriter = { mainWriter },
+             incomingResponseWriter = incomingWriter,
+             registeredDialogWriter = registeredWriter,
+-            fallbackWriter = {
+-                fallbackCalled = true
+-                ByteArrayOutputStream()
+-            },
+         )
+ 
+-        assertSame(incomingWriter, selected)
+-        check(!fallbackCalled)
++        assertSame(mainWriter, selected)
+     }
+ 
+     @Test
+-    fun `registered dialog writer wins when call has no stored writer`() {
++    fun `incoming dialog writer is the fallback when the main flow is unavailable`() {
++        val incomingWriter = ByteArrayOutputStream()
+         val registeredWriter = ByteArrayOutputStream()
+ 
+         val selected = SipRemoteDialogTermination.localDialogRequestWriter(
+-            incomingResponseWriter = null,
++            mainFlowWriter = { throw java.io.IOException("main SIP flow unavailable") },
++            incomingResponseWriter = incomingWriter,
+             registeredDialogWriter = registeredWriter,
+-            fallbackWriter = { ByteArrayOutputStream() },
+         )
+ 
+-        assertSame(registeredWriter, selected)
++        assertSame(incomingWriter, selected)
+     }
+ 
+     @Test
+-    fun `main flow is used only without a dialog writer`() {
+-        val fallbackWriter = ByteArrayOutputStream()
++    fun `registered dialog writer is used when neither main nor incoming writers exist`() {
++        val registeredWriter = ByteArrayOutputStream()
+ 
+         val selected = SipRemoteDialogTermination.localDialogRequestWriter(
++            mainFlowWriter = { throw java.io.IOException("main SIP flow unavailable") },
+             incomingResponseWriter = null,
+-            registeredDialogWriter = null,
+-            fallbackWriter = { fallbackWriter },
++            registeredDialogWriter = registeredWriter,
+         )
+ 
+-        assertSame(fallbackWriter, selected)
++        assertSame(registeredWriter, selected)
++    }
++
++    @Test
++    fun `writer selection fails loudly when no transport is available`() {
++        try {
++            SipRemoteDialogTermination.localDialogRequestWriter(
++                mainFlowWriter = { throw java.io.IOException("main SIP flow unavailable") },
++                incomingResponseWriter = null,
++                registeredDialogWriter = null,
++            )
++            throw AssertionError("expected localDialogRequestWriter to rethrow")
++        } catch (expected: java.io.IOException) {
++        }
+     }
+ }
+-- 
+2.47.3
+
